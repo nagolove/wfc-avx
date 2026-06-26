@@ -170,6 +170,13 @@ void wfc_destroy(struct wfc *wfc);
 #include <time.h>
 #include <assert.h>
 
+// AVX2 ускоряет проверку совместимости тайлов в горячем цикле пропагации.
+// Включается автоматически при -mavx2 / -march=native, иначе - скаляр.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define WFC_USE_AVX2 1
+#endif
+
 #ifndef WFC_USE_STB
 
 #define wfc_img_save(...) wfc__nofunc_int("wfc_img_save", "requires stb", __VA_ARGS__)
@@ -276,6 +283,27 @@ static inline int wfc__bitset_popcount(const unsigned *bs, int len)
   for (int i = 0; i < len; i++)
     cnt += __builtin_popcount(bs[i]);
   return cnt;
+}
+
+// Есть ли хоть один общий бит у (a & b) по len словам? Горячая проверка
+// пропагации: "поддержан ли тайл хоть одним тайлом соседней ячейки".
+// AVX2: AND + OR-редукция блоками по 256 бит с ранним выходом; иначе скаляр.
+static inline int wfc__bitset_intersects(const unsigned *a, const unsigned *b, int len)
+{
+  int w = 0;
+#ifdef WFC_USE_AVX2
+  for (; w + 8 <= len; w += 8) {
+    __m256i va = _mm256_loadu_si256((const __m256i *)(a + w));
+    __m256i vb = _mm256_loadu_si256((const __m256i *)(b + w));
+    __m256i vx = _mm256_and_si256(va, vb);
+    if (!_mm256_testz_si256(vx, vx)) // нашли пересечение - дальше не считаем
+      return 1;
+  }
+#endif
+  for (; w < len; w++)
+    if (a[w] & b[w])
+      return 1;
+  return 0;
 }
 
 // Returns next set bit index >= start, or -1 if none
@@ -1076,12 +1104,8 @@ static int wfc__propagate_prop(struct wfc *wfc, struct wfc__prop *p)
       bits &= bits - 1;  // clear lowest set bit
 
       // Is tile t enabled by any tile in the source cell?
-      unsigned total = 0;
       unsigned *compat = &at[t * bitset_len];
-      for (int w = 0; w < bitset_len; w++)
-        total |= src_cell->tiles[w] & compat[w];
-
-      if (!total) {
+      if (!wfc__bitset_intersects(src_cell->tiles, compat, bitset_len)) {
         wfc__bitset_clear(dst_cell->tiles, t);
         dst_cell->tile_cnt--;
         dst_cell->entropy += wfc->tiles[t].plogp;
